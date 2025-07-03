@@ -1,0 +1,7 @@
+azure-functions
+cryptography
+azure-identity
+azure-core
+msal
+requests
+setuptools-rust

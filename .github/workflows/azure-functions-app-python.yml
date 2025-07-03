@@ -1,0 +1,195 @@
+name: Deploy Python project to Azure Function App
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  FRONTEND_APP_NAME: 'fa-apim-auth-frontend-001'
+  BACKEND_APP_NAME: 'fa-apim-auth-backend-001'
+  APIM_NAME: 'apim-apim-auth-001'
+  FRONTEND_PATH: 'src/function-apps/frontend'
+  BACKEND_PATH: 'src/function-apps/backend'
+  PYTHON_VERSION: '3.12'
+  RESOURCE_GROUP: '${{ env.RESOURCE_GROUP}}'
+
+jobs:
+  create-app-registration:
+    runs-on: ubuntu-latest
+    outputs:
+      client_id: ${{ steps.create-app.outputs.client_id }}
+      cs: ${{ steps.create-app.outputs.cs }}
+    steps:
+    - name: 'Login via Azure CLI'
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: 'Create or Get App Registration'
+      id: create-app
+      shell: pwsh
+      run: |
+        # Check if app registration exists
+        $appName = "appreg-${{ env.BACKEND_APP_NAME }}"
+        $existingApp = az ad app list --display-name $appName --query "[0]" -o json | ConvertFrom-Json
+        
+        if ($existingApp) {
+            Write-Host "App registration '$appName' already exists. Using existing app."
+            $clientId = $existingApp.appId
+
+        } else {
+            Write-Host "Creating new app registration '$appName'..."
+            $app = az ad app create --display-name $appName --query "{clientId:appId,objectId:id}" -o json | ConvertFrom-Json
+            $clientId = $app.clientId
+            
+            # Expose API for new app
+            az ad app update --id $clientId --identifier-uris "api://$clientId"
+        }
+        
+        # Set step outputs
+        "client_id=$clientId" >> $env:GITHUB_OUTPUT
+
+  deploy-infrastructure:
+    needs: create-app-registration
+    runs-on: ubuntu-latest
+    steps:
+    - name: 'Checkout GitHub Action'
+      uses: actions/checkout@v4
+
+    - name: 'Login via Azure CLI'
+      uses: azure/login@v1
+      with:
+         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: 'Deploy Bicep Template'
+      uses: Azure/arm-deploy@v1
+      with:
+        resourceGroupName: '${{ env.RESOURCE_GROUP}}'
+        template: 'bicep/infrastructure/main.bicep'
+        failOnStdErr: false
+        parameters: >
+          backendClientId=${{ needs.create-app-registration.outputs.client_id }}
+          publisherEmail=${{ secrets.APIM_PUBLISHER_EMAIL }}
+          publisherName=${{ secrets.APIM_PUBLISHER_NAME }}
+
+  deploy-frontend-code:
+    needs: deploy-infrastructure
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: 'Install Frontend Dependencies'
+      working-directory: ${{ env.FRONTEND_PATH }}
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+        mkdir -p .python_packages/lib/site-packages
+        pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+
+    - uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: 'Deploy Frontend Function'
+      shell: pwsh
+      run: |
+        Compress-Archive -Path "${{ env.FRONTEND_PATH }}\*" -DestinationPath "frontend.zip" -Force
+        az functionapp deployment source config-zip `
+          --resource-group ${{ env.RESOURCE_GROUP}} `
+          --name ${{ env.FRONTEND_APP_NAME }} `
+          --src frontend.zip `
+          --build-remote true
+
+  deploy-backend-code:
+    needs: deploy-infrastructure
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: 'Install Backend Dependencies'
+      working-directory: ${{ env.BACKEND_PATH }}
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+        mkdir -p .python_packages/lib/site-packages
+        pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+
+    - uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: 'Deploy Backend Function and Import to APIM'
+      shell: pwsh
+      run: |
+        Compress-Archive -Path "${{ env.BACKEND_PATH }}\*" -DestinationPath "backend.zip" -Force
+        az functionapp deployment source config-zip `
+          --resource-group ${{ env.RESOURCE_GROUP}} `
+          --name ${{ env.BACKEND_APP_NAME }} `
+          --src backend.zip `
+          --build-remote true
+
+  deploy-backend-config:
+    needs: [deploy-backend-code, create-app-registration] 
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: 'Login via Azure CLI'
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    
+    - name: 'Configure Function App Settings'
+      shell: pwsh
+      run: |
+        $expiryDate = (Get-Date).AddMonths(1).ToString("yyyy-MM-dd")
+        $secret = az ad app credential reset `
+          --id ${{ needs.create-app-registration.outputs.client_id }} `
+          --display-name "Auth-Secret" `
+          --end-date $expiryDate `
+          --query password `
+          -o tsv
+        
+        az functionapp config appsettings set `
+          --name ${{ env.BACKEND_APP_NAME }} `
+          --resource-group ${{ env.RESOURCE_GROUP}} `
+          --settings MICROSOFT_PROVIDER_AUTHENTICATION_SECRET="$secret"
+
+    - name: 'Get Frontend Function App IDs'
+      shell: pwsh
+      run: |
+        $objectId = az functionapp identity show -g ${{ env.RESOURCE_GROUP}} -n ${{ env.FRONTEND_APP_NAME }} --query principalId -o tsv
+        $applicationId = az ad sp show --id $objectId --query appId -o tsv
+        echo "FRONTEND_OBJECT_ID=$objectId" >> $env:GITHUB_ENV
+        echo "FRONTEND_APPLICATION_ID=$applicationId" >> $env:GITHUB_ENV
+
+    - name: 'Deploy backend config'
+      uses: Azure/arm-deploy@v1
+      with:
+        resourceGroupName: '${{ env.RESOURCE_GROUP}}'
+        template: 'bicep/services/main.bicep'
+        parameters: >
+          frontendFunctionObjectId=${{ env.FRONTEND_OBJECT_ID }}
+          frontendFunctionApplicationId=${{ env.FRONTEND_APPLICATION_ID }}
+          backendFunctionName=${{ env.BACKEND_APP_NAME }}
+          environmentName=apim-auth
+          apimServiceName=${{ env.APIM_NAME }}
+          entraAuthClientId=${{ needs.create-app-registration.outputs.client_id }}
+        failOnStdErr: false

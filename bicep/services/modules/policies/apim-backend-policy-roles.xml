@@ -1,0 +1,28 @@
+<policies>
+    <inbound>
+        <base />
+        <validate-azure-ad-token tenant-id="{tenantId}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. Access token is missing or invalid." require-scheme="Bearer">
+            <audiences>
+                <audience>{entraAuthClientId}</audience>
+            </audiences>
+            <client-application-ids>
+                <application-id>{frontendFunctionApplicationId}</application-id>
+            </client-application-ids>
+            <required-claims>
+                <claim name="roles" match="all">
+                    <value>BackendAPI.Access</value>
+                </claim>
+            </required-claims>
+        </validate-azure-ad-token>
+        <set-backend-service backend-id="{backendFunctionName}" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
